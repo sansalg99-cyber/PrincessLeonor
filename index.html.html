@@ -1,0 +1,272 @@
+const express = require('express');
+const mongoose = require('mongoose');
+const cors = require('cors');
+const dotenv = require('dotenv');
+const nodemailer = require('nodemailer');
+const jwt = require('jsonwebtoken');
+const bcrypt = require('bcryptjs');
+const path = require('path');
+
+dotenv.config();
+const app = express();
+
+// Middleware
+app.use(cors());
+app.use(express.json());
+app.use(express.static('public'));
+
+// MongoDB Connection
+mongoose.connect(process.env.MONGODB_URI || 'mongodb://localhost:27017/giveaway-tracker', {
+    useNewUrlParser: true,
+    useUnifiedTopology: true,
+})
+.then(() => console.log('✓ MongoDB connected'))
+.catch(err => console.error('MongoDB connection error:', err));
+
+// ======================== SCHEMAS ========================
+
+// Package Schema
+const packageSchema = new mongoose.Schema({
+    trackingId: { type: String, unique: true, required: true },
+    packageName: String,
+    recipientName: String,
+    recipientEmail: String,
+    deliveryAddress: String,
+    estimatedDeliveryDate: Date,
+    createdAt: { type: Date, default: Date.now },
+    status: [{
+        title: String,
+        description: String,
+        date: Date,
+        completed: { type: Boolean, default: false },
+        active: { type: Boolean, default: false }
+    }],
+    currentStatus: String,
+    notificationsSent: [String]
+});
+
+// Admin Schema
+const adminSchema = new mongoose.Schema({
+    email: { type: String, unique: true, required: true },
+    password: String,
+    createdAt: { type: Date, default: Date.now }
+});
+
+// ======================== MODELS ========================
+
+const Package = mongoose.model('Package', packageSchema);
+const Admin = mongoose.model('Admin', adminSchema);
+
+// ======================== EMAIL SETUP ========================
+
+const transporter = nodemailer.createTransport({
+    service: 'gmail',
+    auth: {
+        user: process.env.EMAIL_USER,
+        pass: process.env.EMAIL_PASSWORD
+    }
+});
+
+const sendNotificationEmail = async (recipientEmail, packageName, status, trackingId) => {
+    try {
+        const mailOptions = {
+            from: process.env.EMAIL_USER,
+            to: recipientEmail,
+            subject: `📦 Your Giveaway Package Update - ${packageName}`,
+            html: `
+                <div style="font-family: Arial, sans-serif; max-width: 600px; margin: 0 auto;">
+                    <div style="background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); color: white; padding: 30px; text-align: center; border-radius: 10px 10px 0 0;">
+                        <h2>🎁 Your Package Status Updated</h2>
+                    </div>
+                    <div style="background: #f5f5f5; padding: 30px; border-radius: 0 0 10px 10px;">
+                        <h3>Package: ${packageName}</h3>
+                        <p><strong>Current Status:</strong> ${status}</p>
+                        <p><strong>Tracking ID:</strong> ${trackingId}</p>
+                        <p style="margin-top: 20px;">
+                            <a href="${process.env.FRONTEND_URL}/track?id=${trackingId}" 
+                               style="background: #667eea; color: white; padding: 12px 30px; text-decoration: none; border-radius: 5px; display: inline-block;">
+                                Track Your Package
+                            </a>
+                        </p>
+                        <p style="margin-top: 20px; font-size: 12px; color: #666;">
+                            Thank you for participating in our giveaway!
+                        </p>
+                    </div>
+                </div>
+            `
+        };
+
+        await transporter.sendMail(mailOptions);
+        console.log(`✓ Email sent to ${recipientEmail}`);
+        return true;
+    } catch (error) {
+        console.error('Email sending failed:', error);
+        return false;
+    }
+};
+
+// ======================== ROUTES ========================
+
+// 1. Track Package
+app.get('/api/package/:trackingId', async (req, res) => {
+    try {
+        const pkg = await Package.findOne({ trackingId: req.params.trackingId.toUpperCase() });
+        
+        if (!pkg) {
+            return res.status(404).json({ message: 'Package not found' });
+        }
+
+        res.json(pkg);
+    } catch (error) {
+        res.status(500).json({ message: 'Server error', error });
+    }
+});
+
+// 2. Admin Register
+app.post('/api/admin/register', async (req, res) => {
+    try {
+        const { email, password } = req.body;
+
+        if (await Admin.findOne({ email })) {
+            return res.status(400).json({ message: 'Admin already exists' });
+        }
+
+        const hashedPassword = await bcrypt.hash(password, 10);
+        const admin = new Admin({ email, password: hashedPassword });
+        await admin.save();
+
+        res.status(201).json({ message: 'Admin registered successfully' });
+    } catch (error) {
+        res.status(500).json({ message: 'Server error', error });
+    }
+});
+
+// 3. Admin Login
+app.post('/api/admin/login', async (req, res) => {
+    try {
+        const { email, password } = req.body;
+        const admin = await Admin.findOne({ email });
+
+        if (!admin || !(await bcrypt.compare(password, admin.password))) {
+            return res.status(401).json({ message: 'Invalid credentials' });
+        }
+
+        const token = jwt.sign({ adminId: admin._id }, process.env.JWT_SECRET || 'your_secret_key', {
+            expiresIn: '7d'
+        });
+
+        res.json({ token, message: 'Login successful' });
+    } catch (error) {
+        res.status(500).json({ message: 'Server error', error });
+    }
+});
+
+// Middleware to verify admin token
+const verifyAdmin = (req, res, next) => {
+    const token = req.headers.authorization?.split(' ')[1];
+    
+    if (!token) {
+        return res.status(401).json({ message: 'No token provided' });
+    }
+
+    try {
+        jwt.verify(token, process.env.JWT_SECRET || 'your_secret_key');
+        next();
+    } catch (error) {
+        res.status(401).json({ message: 'Invalid token' });
+    }
+};
+
+// 4. Create Package (Admin)
+app.post('/api/packages', verifyAdmin, async (req, res) => {
+    try {
+        const { trackingId, packageName, recipientName, recipientEmail, deliveryAddress, estimatedDeliveryDate } = req.body;
+
+        const newPackage = new Package({
+            trackingId: trackingId.toUpperCase(),
+            packageName,
+            recipientName,
+            recipientEmail,
+            deliveryAddress,
+            estimatedDeliveryDate,
+            status: [
+                { title: 'Order Confirmed', description: 'Your giveaway has been selected!', date: new Date(), completed: true, active: false }
+            ],
+            currentStatus: 'Order Confirmed'
+        });
+
+        await newPackage.save();
+
+        // Send confirmation email
+        await sendNotificationEmail(recipientEmail, packageName, 'Order Confirmed', trackingId.toUpperCase());
+
+        res.status(201).json({ message: 'Package created successfully', package: newPackage });
+    } catch (error) {
+        res.status(500).json({ message: 'Server error', error });
+    }
+});
+
+// 5. Update Package Status (Admin)
+app.put('/api/packages/:trackingId', verifyAdmin, async (req, res) => {
+    try {
+        const { title, description } = req.body;
+        const pkg = await Package.findOne({ trackingId: req.params.trackingId.toUpperCase() });
+
+        if (!pkg) {
+            return res.status(404).json({ message: 'Package not found' });
+        }
+
+        // Set previous status to not active
+        pkg.status.forEach(s => s.active = false);
+
+        // Add new status
+        pkg.status.push({
+            title,
+            description,
+            date: new Date(),
+            completed: true,
+            active: true
+        });
+
+        pkg.currentStatus = title;
+        await pkg.save();
+
+        // Send email notification
+        await sendNotificationEmail(pkg.recipientEmail, pkg.packageName, title, pkg.trackingId);
+
+        res.json({ message: 'Package status updated', package: pkg });
+    } catch (error) {
+        res.status(500).json({ message: 'Server error', error });
+    }
+});
+
+// 6. Get All Packages (Admin)
+app.get('/api/packages', verifyAdmin, async (req, res) => {
+    try {
+        const packages = await Package.find();
+        res.json(packages);
+    } catch (error) {
+        res.status(500).json({ message: 'Server error', error });
+    }
+});
+
+// 7. Delete Package (Admin)
+app.delete('/api/packages/:trackingId', verifyAdmin, async (req, res) => {
+    try {
+        await Package.deleteOne({ trackingId: req.params.trackingId.toUpperCase() });
+        res.json({ message: 'Package deleted successfully' });
+    } catch (error) {
+        res.status(500).json({ message: 'Server error', error });
+    }
+});
+
+// Health check
+app.get('/api/health', (req, res) => {
+    res.json({ status: 'Server is running' });
+});
+
+// Start Server
+const PORT = process.env.PORT || 5000;
+app.listen(PORT, () => {
+    console.log(`✓ Server running on http://localhost:${PORT}`);
+});
